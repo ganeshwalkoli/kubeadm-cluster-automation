@@ -1,143 +1,308 @@
-# Kubernetes 1.35 Air-Gapped Installation SOP
+# Kubernetes Air-Gapped Setup — Tarball / Offline Bundle
 
-This document outlines the procedure to install Kubernetes in a strictly air-gapped environment where nodes have zero internet access.
+## Architecture Overview
+`[Internet-Connected Machine] → Download Everything → Bundle → Transfer (USB/SCP/SFTP) → [Air-Gapped Machine] → Install`
 
-## Prerequisites
-- An **Online Machine** (RHEL 9) with internet access and Docker installed.
-- The **Air-Gapped Nodes** (RHEL 9) where Kubernetes will be installed.
-- A secure method to transfer files between the online machine and air-gapped nodes (e.g., Secure USB, internal file server).
+## STEP 1: On Internet-Connected Machine — Download Everything
 
----
-
-## 1. Private Container Registry Setup (On Air-Gapped Network)
-
-To serve container images to your cluster, you must run a private registry inside the air-gapped network. We will use the official Docker `registry:2` image.
-
-### Step 1.1: Download Registry Image (Online Machine)
-On your internet-connected machine, pull and save the registry image:
+### 1.1 Create Download Directory Structure
 ```bash
-docker pull registry:2
-docker save registry:2 > registry_image.tar
-```
-*Transfer `registry_image.tar` to your air-gapped registry server.*
-
-### Step 1.2: Start the Registry (Air-Gapped Server)
-On the air-gapped server that will act as your registry (assuming Docker is installed):
-```bash
-# Load the image
-docker load < registry_image.tar
-
-# Run the registry on port 5000
-docker run -d -p 5000:5000 --restart=always --name private-registry registry:2
-```
-*Note: In a production environment, you must configure TLS/SSL for this registry so `containerd` can pull securely, or configure `containerd` on all nodes to treat `http://<REGISTRY_IP>:5000` as an insecure registry.*
-
----
-
-## 2. Prepare Container Images
-
-You need to pull all necessary Kubernetes and Calico images, move them across the air gap, and push them to your new private registry.
-
-### Step 2.1: Pull and Save Images (Online Machine)
-```bash
-# Get the list of required Kubernetes images
-kubeadm config images list --kubernetes-version v1.35.0 > k8s_images.txt
-
-# Pull each K8s image
-for i in $(cat k8s_images.txt); do docker pull $i; done
-
-# Pull Calico images (Tigera operator & Calico node)
-docker pull quay.io/tigera/operator:v1.34.0 # (Use your specific Calico version)
-docker pull docker.io/calico/cni:v3.28.0
-docker pull docker.io/calico/node:v3.28.0
-docker pull docker.io/calico/kube-controllers:v3.28.0
-
-# Save all images to a tarball
-docker save $(cat k8s_images.txt) quay.io/tigera/operator:v1.34.0 calico/cni:v3.28.0 calico/node:v3.28.0 calico/kube-controllers:v3.28.0 > all_k8s_images.tar
-```
-*Transfer `all_k8s_images.tar` to a machine in the air-gapped network.*
-
-### Step 2.2: Push to Private Registry (Air-Gapped Network)
-Load the tarball and push them to your new private registry (`<REGISTRY_IP>:5000`):
-```bash
-docker load < all_k8s_images.tar
-
-# Tag and push each image (Example for kube-apiserver)
-docker tag registry.k8s.io/kube-apiserver:v1.35.0 <REGISTRY_IP>:5000/kube-apiserver:v1.35.0
-docker push <REGISTRY_IP>:5000/kube-apiserver:v1.35.0
-
-# Repeat the tag and push for ALL K8s and Calico images
+mkdir -p ~/k8s-airgap/{rpms,images,cni,calico,configs}
+cd ~/k8s-airgap
 ```
 
----
-
-## 3. Create a Local YUM/RPM Repository
-
-You must provide the RPM packages (like `containerd`, `kubeadm`, `kubelet`, `kubectl`) to the offline nodes without relying on `pkgs.k8s.io`.
-
-### Step 3.1: Download RPMs (Online Machine)
-On a RHEL 9 online machine, download the required packages and their dependencies:
+### 1.2 Download Kubernetes & Docker RPM Packages
 ```bash
-# Add the K8s and Docker repo configurations first
-# Then use yumdownloader/dnf download to fetch packages but not install them
-mkdir -p /root/k8s-rpms
-cd /root/k8s-rpms
-dnf download --resolve --alldeps containerd.io kubeadm kubelet kubectl
-
-# Install createrepo to generate repo metadata
-dnf install -y createrepo
-createrepo /root/k8s-rpms
-
-# Archive the directory for transfer
-cd /root
-tar -czvf k8s-rpms.tar.gz k8s-rpms/
-```
-*Transfer `k8s-rpms.tar.gz` to your air-gapped nodes.*
-
-### Step 3.2: Configure YUM (Air-Gapped Nodes)
-Transfer the `k8s-rpms.tar.gz` archive to the air-gapped node and extract it to `/opt`:
-```bash
-# Extract the archive
-tar -xzvf k8s-rpms.tar.gz -C /opt/
-```
-
-Create a local repo file: `/etc/yum.repos.d/local-k8s.repo`
-```ini
-[local-k8s]
-name=Local Kubernetes Repository
-baseurl=file:///opt/k8s-rpms
+# Add Kubernetes repo
+cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://pkgs.k8s.io/core:/stable:/v1.35/rpm/
 enabled=1
-gpgcheck=0
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/core:/stable:/v1.35/rpm/repodata/repomd.xml.key
+EOF
+
+# Add Docker CE repo for containerd
+dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+
+# Download RPMs with all dependencies
+dnf download --resolve --destdir=~/k8s-airgap/rpms \
+  kubelet \
+  kubeadm \
+  kubectl \
+  containerd.io \
+  containernetworking-plugins
+
+# Download GPG key
+curl -o ~/k8s-airgap/rpms/kubernetes-gpg.key \
+  https://pkgs.k8s.io/core:/stable:/v1.35/rpm/repodata/repomd.xml.key
 ```
-Install the packages:
+
+### 1.3 Download RHEL/CentOS Dependencies
 ```bash
-dnf install -y containerd.io kubelet kubeadm kubectl
-systemctl enable --now kubelet
+dnf download --resolve --destdir=~/k8s-airgap/rpms \
+  socat \
+  conntrack \
+  ipset \
+  ipvsadm \
+  ebtables \
+  tc \
+  iproute-tc \
+  libseccomp
+```
+
+### 1.4 Pull & Export Kubernetes Core Images
+```bash
+K8S_VERSION="v1.35.0"
+cd ~/k8s-airgap/images
+
+# Pull all required kubeadm images
+kubeadm config images pull --kubernetes-version ${K8S_VERSION}
+
+# List and export each image
+for image in $(kubeadm config images list --kubernetes-version ${K8S_VERSION}); do
+  filename=$(echo $image | tr '/:' '_')
+  echo "Exporting $image → ${filename}.tar"
+  ctr -n k8s.io image export ${filename}.tar $image
+done
+```
+
+### 1.5 Pull & Export Containerd Pause Image
+```bash
+PAUSE_IMAGE="registry.k8s.io/pause:3.9"
+ctr image pull $PAUSE_IMAGE
+ctr image export ~/k8s-airgap/images/pause.tar $PAUSE_IMAGE
+```
+
+### 1.6 Download CNI Plugins
+```bash
+CNI_VERSION="v1.4.0"
+cd ~/k8s-airgap/cni
+
+curl -LO "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-amd64-${CNI_VERSION}.tgz"
+curl -LO "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-amd64-${CNI_VERSION}.tgz.sha256"
+```
+
+### 1.7 Download & Export Calico Images
+```bash
+CALICO_VERSION="v3.27.0"
+cd ~/k8s-airgap/calico
+
+# Download Calico manifests
+curl -LO "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml"
+
+# Pull Calico images
+CALICO_IMAGES=(
+  "docker.io/calico/cni:${CALICO_VERSION}"
+  "docker.io/calico/node:${CALICO_VERSION}"
+  "docker.io/calico/kube-controllers:${CALICO_VERSION}"
+)
+
+for image in "${CALICO_IMAGES[@]}"; do
+  ctr image pull $image
+  filename=$(echo $image | tr '/:' '_')
+  ctr image export ${filename}.tar $image
+  echo "Exported: ${filename}.tar"
+done
+```
+
+### 1.8 Create Repo Metadata for RPMs
+```bash
+# Install createrepo if not present
+dnf install -y createrepo
+
+# Generate local repo metadata
+createrepo ~/k8s-airgap/rpms/
+```
+
+### 1.9 Bundle Everything
+```bash
+cd ~
+tar -czvf k8s-airgap-bundle.tar.gz k8s-airgap/
+
+# Generate checksum for verification
+sha256sum k8s-airgap-bundle.tar.gz > k8s-airgap-bundle.sha256
+
+echo "Bundle size: $(du -sh k8s-airgap-bundle.tar.gz)"
+```
+
+## STEP 2: Transfer Bundle to Air-Gapped Environment
+```bash
+# Option A — SCP
+scp k8s-airgap-bundle.tar.gz user@airgap-server:/tmp/
+
+# Option B — USB (mount and copy)
+cp k8s-airgap-bundle.tar.gz /media/usb-drive/
+
+# Option C — SFTP
+sftp user@airgap-server
+> put k8s-airgap-bundle.tar.gz /tmp/
+```
+
+## STEP 3: On Air-Gapped Machine — Extract Bundle
+```bash
+cd /tmp
+# Verify checksum
+sha256sum -c k8s-airgap-bundle.sha256
+
+# Extract
+tar -xzvf k8s-airgap-bundle.tar.gz -C /opt/
+cd /opt/k8s-airgap
+```
+
+## STEP 4: Install on Air-Gapped Nodes
+
+### 4.1 Setup Local YUM Repository
+```bash
+cat <<EOF | sudo tee /etc/yum.repos.d/k8s-local.repo
+[k8s-local]
+name=Kubernetes Local Repo
+baseurl=file:///opt/k8s-airgap/rpms
+enabled=1
+gpgcheck=1
+gpgkey=file:///opt/k8s-airgap/rpms/kubernetes-gpg.key
+EOF
+
+# Disable all other repos to avoid internet calls
+dnf install -y --disablerepo="*" --enablerepo="k8s-local" \
+  kubelet kubeadm kubectl containerd.io \
+  socat conntrack ipset ipvsadm
+```
+
+### 4.2 Install CNI Plugins
+```bash
+mkdir -p /opt/cni/bin
+tar -xzvf /opt/k8s-airgap/cni/cni-plugins-linux-amd64-*.tgz -C /opt/cni/bin/
+```
+
+### 4.3 Configure Containerd
+```bash
+# Generate default config
+containerd config default > /etc/containerd/config.toml
+
+# Update sandbox (pause) image to local if using private registry
+sed -i 's|registry.k8s.io/pause:.*|registry.k8s.io/pause:3.9|' \
+  /etc/containerd/config.toml
+
+# Use systemd cgroup driver
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' \
+  /etc/containerd/config.toml
+
+systemctl enable --now containerd
+```
+
+### 4.4 Import All Container Images
+```bash
+# Import Kubernetes core images
+for tar in /opt/k8s-airgap/images/*.tar; do
+  echo "Importing $tar..."
+  ctr -n k8s.io image import $tar
+done
+
+# Import Calico images
+for tar in /opt/k8s-airgap/calico/*.tar; do
+  echo "Importing $tar..."
+  ctr -n k8s.io image import $tar
+done
+
+# Verify all images loaded
+crictl images
+```
+
+### 4.5 Pre-flight System Config
+```bash
+# Disable swap
+swapoff -a
+sed -i '/swap/d' /etc/fstab
+
+# Load kernel modules
+modprobe overlay
+modprobe br_netfilter
+
+cat <<EOF | tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+
+# Kernel parameters
+cat <<EOF | tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sysctl --system
+
+# Disable SELinux (or set to permissive)
+setenforce 0
+sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config
+```
+
+### 4.6 Initialize Kubernetes Cluster
+```bash
+# Create kubeadm config (offline mode)
+cat <<EOF > /opt/k8s-airgap/configs/kubeadm-config.yaml
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: v1.35.0
+imageRepository: registry.k8s.io   # Uses locally imported images
+networking:
+  podSubnet: "192.168.0.0/16"       # Calico default
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: <MASTER-NODE-IP>
+  bindPort: 6443
+EOF
+
+# Initialize — will use locally imported images
+kubeadm init \
+  --config=/opt/k8s-airgap/configs/kubeadm-config.yaml \
+  --upload-certs
+
+# Setup kubectl access
+mkdir -p $HOME/.kube
+cp /etc/kubernetes/admin.conf $HOME/.kube/config
+```
+
+### 4.7 Apply Calico CNI (Offline)
+```bash
+# Apply directly from local file
+kubectl apply -f /opt/k8s-airgap/calico/calico.yaml
+
+# Verify nodes and pods
+kubectl get nodes
+kubectl get pods -A
+```
+
+### 4.8 Join Worker Nodes
+```bash
+# On master — get join command
+kubeadm token create --print-join-command
+
+# Copy bundle to each worker node and repeat Steps 4.1 to 4.5
+# Then run the join command on each worker
+kubeadm join <MASTER-IP>:6443 \
+  --token <token> \
+  --discovery-token-ca-cert-hash sha256:<hash>
 ```
 
 ---
 
-## 4. Install Kubernetes using Offline Resources
+## Complete Checklist
 
-Now that the packages are installed and the private registry is populated, you must instruct `kubeadm` and Calico to use them.
-
-### Step 4.1: Run Kubeadm Init
-When initializing the control plane, tell `kubeadm` to pull from your private registry instead of the internet:
-```bash
-kubeadm init \
-  --image-repository <REGISTRY_IP>:5000 \
-  --kubernetes-version v1.35.0 \
-  --pod-network-cidr=192.168.0.0/16
-```
-
-### Step 4.2: Adjust Calico Manifests
-Before applying Calico, edit the `tigera-operator.yaml` and `custom-resources.yaml` files.
-Find all instances of `quay.io/` or `docker.io/` and replace them with `<REGISTRY_IP>:5000/`.
-
-Apply the modified files:
-```bash
-kubectl create -f tigera-operator.yaml
-kubectl create -f custom-resources.yaml
-```
-
-The cluster will now successfully provision completely offline!
+| Task | Status |
+| :--- | :--- |
+| RPM packages downloaded with dependencies | ✅ |
+| createrepo metadata generated | ✅ |
+| All k8s core images exported as tarballs | ✅ |
+| Calico images exported as tarballs | ✅ |
+| CNI plugins tarball downloaded | ✅ |
+| Bundle transferred to air-gapped machine | ✅ |
+| Local YUM repo configured | ✅ |
+| Images imported via ctr | ✅ |
+| Containerd configured with systemd cgroup | ✅ |
+| kubeadm init completed successfully | ✅ |
+| Calico CNI applied | ✅ |
+| Worker nodes joined | ✅ |
