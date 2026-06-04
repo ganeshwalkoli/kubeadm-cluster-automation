@@ -1,11 +1,17 @@
 #!/bin/bash
+WORK_DIR="${PWD}/k8s-airgap"
 set -e
+
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root using sudo"
+  exit 1
+fi
 
 echo "Starting Kubernetes Air-Gap Bundling Process..."
 
 # 1.1 Create Download Directory Structure
-mkdir -p ~/k8s-airgap/{rpms,images,cni,calico,configs}
-cd ~/k8s-airgap
+mkdir -p ${WORK_DIR}/{rpms,images,cni,calico,configs}
+cd ${WORK_DIR}
 
 echo "Setting up repositories..."
 # 1.2 Download Kubernetes & Docker RPM Packages
@@ -20,20 +26,26 @@ EOF
 
 sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
 
-echo "Downloading RPMs..."
-sudo dnf download --resolve --destdir=~/k8s-airgap/rpms \
-  kubelet kubeadm kubectl containerd.io containernetworking-plugins
+echo "Installing local tools required for bundling..."
+sudo dnf install -y containerd.io kubeadm-1.35.5
+sudo containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+sudo systemctl restart containerd
+sudo systemctl enable --now containerd
 
-curl -sL -o ~/k8s-airgap/rpms/kubernetes-gpg.key \
+echo "Downloading RPMs..."
+sudo dnf download --resolve --destdir=${WORK_DIR}/rpms \
+  kubelet-1.35.5*.$(uname -m) kubeadm-1.35.5*.$(uname -m) kubectl-1.35.5*.$(uname -m) containerd.io containernetworking-plugins
+
+curl -sL -o ${WORK_DIR}/rpms/kubernetes-gpg.key \
   https://pkgs.k8s.io/core:/stable:/v1.35/rpm/repodata/repomd.xml.key
 
 echo "Downloading Dependencies..."
-sudo dnf download --resolve --destdir=~/k8s-airgap/rpms \
-  socat conntrack ipset ipvsadm ebtables tc iproute-tc libseccomp
+sudo dnf download --resolve --destdir=${WORK_DIR}/rpms \
+  socat conntrack ipset ipvsadm ebtables iproute-tc libseccomp iptables iptables-libs
 
 # 1.4 Pull & Export Kubernetes Core Images
-K8S_VERSION="v1.35.0"
-cd ~/k8s-airgap/images
+K8S_VERSION="v1.35.5"
+cd ${WORK_DIR}/images
 echo "Pulling K8s Core Images..."
 sudo kubeadm config images pull --kubernetes-version ${K8S_VERSION}
 
@@ -44,21 +56,21 @@ for image in $(sudo kubeadm config images list --kubernetes-version ${K8S_VERSIO
 done
 
 # 1.5 Pull & Export Containerd Pause Image
-PAUSE_IMAGE="registry.k8s.io/pause:3.9"
+PAUSE_IMAGE="registry.k8s.io/pause:3.10"
 echo "Pulling Pause Image..."
 sudo ctr image pull $PAUSE_IMAGE
-sudo ctr image export ~/k8s-airgap/images/pause.tar $PAUSE_IMAGE
+sudo ctr image export ${WORK_DIR}/images/pause.tar $PAUSE_IMAGE
 
 # 1.6 Download CNI Plugins
-CNI_VERSION="v1.4.0"
-cd ~/k8s-airgap/cni
+CNI_VERSION="v1.5.0"
+cd ${WORK_DIR}/cni
 echo "Downloading CNI plugins..."
 curl -sL -O "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-amd64-${CNI_VERSION}.tgz"
 curl -sL -O "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-amd64-${CNI_VERSION}.tgz.sha256"
 
 # 1.7 Download & Export Calico Images
-CALICO_VERSION="v3.27.0"
-cd ~/k8s-airgap/calico
+CALICO_VERSION="v3.28.0"
+cd ${WORK_DIR}/calico
 echo "Downloading Calico artifacts..."
 curl -sL -O "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml"
 
@@ -78,11 +90,11 @@ done
 # 1.8 Create Repo Metadata for RPMs
 echo "Generating local YUM repository metadata..."
 sudo dnf install -y createrepo
-createrepo ~/k8s-airgap/rpms/
+sudo createrepo ${WORK_DIR}/rpms/
 
 # 1.9 Bundle Everything
 echo "Creating final tarball..."
-cd ~
+cd ${WORK_DIR}/..
 tar -czf k8s-airgap-bundle.tar.gz k8s-airgap/
 sha256sum k8s-airgap-bundle.tar.gz > k8s-airgap-bundle.sha256
 

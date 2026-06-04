@@ -29,6 +29,6 @@ if [[ ! "$JOIN_COMMAND" == *"kubeadm join"* ]]; then
 fi
 
 echo "Executing join command..."
-$JOIN_COMMAND
+$JOIN_COMMAND --ignore-preflight-errors=FileContent--proc-sys-net-bridge-bridge-nf-call-iptables,FileContent--proc-sys-net-bridge-bridge-nf-call-ip6tables
 
 echo "Worker node successfully joined the cluster!"

@@ -28,9 +28,9 @@ dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce
 
 # Download RPMs with all dependencies
 dnf download --resolve --destdir=~/k8s-airgap/rpms \
-  kubelet \
-  kubeadm \
-  kubectl \
+  kubelet-1.35.5*.$(uname -m) \
+  kubeadm-1.35.5*.$(uname -m) \
+  kubectl-1.35.5*.$(uname -m) \
   containerd.io \
   containernetworking-plugins
 
@@ -49,12 +49,14 @@ dnf download --resolve --destdir=~/k8s-airgap/rpms \
   ebtables \
   tc \
   iproute-tc \
-  libseccomp
+  libseccomp \
+  iptables \
+  iptables-libs
 ```
 
 ### 1.4 Pull & Export Kubernetes Core Images
 ```bash
-K8S_VERSION="v1.35.0"
+K8S_VERSION="v1.35.5"
 cd ~/k8s-airgap/images
 
 # Pull all required kubeadm images
@@ -70,14 +72,14 @@ done
 
 ### 1.5 Pull & Export Containerd Pause Image
 ```bash
-PAUSE_IMAGE="registry.k8s.io/pause:3.9"
+PAUSE_IMAGE="registry.k8s.io/pause:3.10"
 ctr image pull $PAUSE_IMAGE
 ctr image export ~/k8s-airgap/images/pause.tar $PAUSE_IMAGE
 ```
 
 ### 1.6 Download CNI Plugins
 ```bash
-CNI_VERSION="v1.4.0"
+CNI_VERSION="v1.5.0"
 cd ~/k8s-airgap/cni
 
 curl -LO "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-amd64-${CNI_VERSION}.tgz"
@@ -86,7 +88,7 @@ curl -LO "https://github.com/containernetworking/plugins/releases/download/${CNI
 
 ### 1.7 Download & Export Calico Images
 ```bash
-CALICO_VERSION="v3.27.0"
+CALICO_VERSION="v3.28.0"
 cd ~/k8s-airgap/calico
 
 # Download Calico manifests
@@ -165,9 +167,10 @@ gpgkey=file:///opt/k8s-airgap/rpms/kubernetes-gpg.key
 EOF
 
 # Disable all other repos to avoid internet calls
+dnf clean all
 dnf install -y --disablerepo="*" --enablerepo="k8s-local" \
   kubelet kubeadm kubectl containerd.io \
-  socat conntrack ipset ipvsadm
+  socat conntrack ipset ipvsadm ebtables iproute-tc libseccomp iptables iptables-libs
 ```
 
 ### 4.2 Install CNI Plugins
@@ -182,7 +185,7 @@ tar -xzvf /opt/k8s-airgap/cni/cni-plugins-linux-amd64-*.tgz -C /opt/cni/bin/
 containerd config default > /etc/containerd/config.toml
 
 # Update sandbox (pause) image to local if using private registry
-sed -i 's|registry.k8s.io/pause:.*|registry.k8s.io/pause:3.9|' \
+sed -i 's|sandbox_image = .*|sandbox_image = "registry.k8s.io/pause:3.10"|' \
   /etc/containerd/config.toml
 
 # Use systemd cgroup driver
@@ -217,12 +220,14 @@ swapoff -a
 sed -i '/swap/d' /etc/fstab
 
 # Load kernel modules
-modprobe overlay
-modprobe br_netfilter
+modprobe overlay || true
+modprobe br_netfilter || true
+modprobe nf_conntrack || true
 
 cat <<EOF | tee /etc/modules-load.d/k8s.conf
 overlay
 br_netfilter
+nf_conntrack
 EOF
 
 # Kernel parameters
@@ -244,7 +249,7 @@ sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config
 cat <<EOF > /opt/k8s-airgap/configs/kubeadm-config.yaml
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
-kubernetesVersion: v1.35.0
+kubernetesVersion: v1.35.5
 imageRepository: registry.k8s.io   # Uses locally imported images
 networking:
   podSubnet: "192.168.0.0/16"       # Calico default

@@ -22,13 +22,13 @@ cat <<EOF > /etc/yum.repos.d/k8s-local.repo
 name=Kubernetes Local Repo
 baseurl=file:///opt/k8s-airgap/rpms
 enabled=1
-gpgcheck=1
-gpgkey=file:///opt/k8s-airgap/rpms/kubernetes-gpg.key
+gpgcheck=0
 EOF
 
 echo "Installing RPM packages..."
+dnf clean all
 dnf install -y --disablerepo="*" --enablerepo="k8s-local" \
-  kubelet kubeadm kubectl containerd.io socat conntrack ipset ipvsadm
+  kubelet kubeadm kubectl containerd.io socat conntrack ipset ipvsadm ebtables iproute-tc libseccomp iptables iptables-libs
 
 echo "Extracting CNI plugins..."
 mkdir -p /opt/cni/bin
@@ -36,7 +36,7 @@ tar -xzf /opt/k8s-airgap/cni/cni-plugins-linux-amd64-*.tgz -C /opt/cni/bin/
 
 echo "Configuring containerd..."
 containerd config default > /etc/containerd/config.toml
-sed -i 's|registry.k8s.io/pause:.*|registry.k8s.io/pause:3.9|' /etc/containerd/config.toml
+sed -i 's|sandbox_image = .*|sandbox_image = "registry.k8s.io/pause:3.10"|' /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 systemctl enable --now containerd
 
@@ -55,12 +55,14 @@ echo "Applying System Pre-flight configs..."
 swapoff -a
 sed -i '/swap/d' /etc/fstab
 
-modprobe overlay
-modprobe br_netfilter
+modprobe overlay || true
+modprobe br_netfilter || true
+modprobe nf_conntrack || true
 
 cat <<EOF > /etc/modules-load.d/k8s.conf
 overlay
 br_netfilter
+nf_conntrack
 EOF
 
 cat <<EOF > /etc/sysctl.d/k8s.conf

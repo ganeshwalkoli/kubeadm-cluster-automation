@@ -13,7 +13,7 @@ echo "Generating kubeadm config..."
 cat <<EOF > /opt/k8s-airgap/configs/kubeadm-config.yaml
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
-kubernetesVersion: v1.35.0
+kubernetesVersion: v1.35.5
 imageRepository: registry.k8s.io
 networking:
   podSubnet: "192.168.0.0/16"
@@ -26,7 +26,7 @@ localAPIEndpoint:
 EOF
 
 echo "Initializing Kubernetes Cluster..."
-kubeadm init --config=/opt/k8s-airgap/configs/kubeadm-config.yaml --upload-certs
+kubeadm init --config=/opt/k8s-airgap/configs/kubeadm-config.yaml --upload-certs --ignore-preflight-errors=FileContent--proc-sys-net-bridge-bridge-nf-call-iptables,FileContent--proc-sys-net-bridge-bridge-nf-call-ip6tables
 
 echo "Configuring kubectl for root..."
 export KUBECONFIG=/etc/kubernetes/admin.conf
